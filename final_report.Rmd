@@ -1,0 +1,214 @@
+---
+title: "Predicting Healthcare Coverage"
+author: "Anand Raman"
+date: "3/16/2019"
+output: html_document
+---
+
+### Introduction
+
+  The data I am using is the household file of the Current Population Survey Annual Social and Economic Supplement. The household file is the questionnaire that was provided to a representative of the household that was surveyed and contains answer that inquire about the status of the household, rather than particular individuals. The data contains demographic information from households such as income, household type, health care coverage, kids under 15 etc. 
+
+  The goal of this project was to predict if a household has healthcare coverage. There were several questions regarding the healthcare coverage status of a household The outcome of interest for me was in terms of current healthcare coverage in the household. Response options were "All members of the household", "Some members of the household" and "No members of the household" have healthcare coverage. Since I was interested in healthcare coverage insecurity, I collapsed the categories of "Some members of the household" and "No members of the household". Thus I had a recoded variable with two response options. 0 corresponds to "All members of the household have healthcare coverage" and 1 corresponds to "Some/No members of the household have have healthcare coverage."
+
+### Packages
+```{r, message=FALSE}
+set.seed(301) 
+library(MASS)
+library(tidyverse)
+library(skimr)
+library(janitor)
+library(broom)
+library(modelr)
+library(glmnet)
+library(glmnetUtils)
+library(leaps)
+library(rpart)
+library(rpart.utils)
+```
+
+## Exploratory Data Analysis
+
+The first step in my exploratory data analysis was to investigate variable types and clean the data. I filtered out observations who were not interviewed, as they were not asked about healthcare coverage. Next, I removed columns that were purely indicators of topcoding and allocation flags (essentially indicators of when responses may have been changed or edited by the survey team). 
+
+```{r, message = FALSE}
+hc_eda <- read_csv("data/asec_clean.csv") %>% clean_names()
+
+hc_eda <- hc_eda %>% sample_frac(.30)
+```
+
+```{r}
+hc_eda %>% 
+  ggplot(aes(x = now_hcov_recode, fill = as.factor(now_hcov_recode))) +
+  geom_bar() +
+  xlab("") +
+  scale_x_discrete() + labs(fill = "Health Care Coverage")
+```
+
+
+This barchart shows that most households, approximately 87% have healthcare coverage for all members of the household. This will be important in the future, as I have some difficulty beating the null classifier. 
+
+
+```{r}
+hc_eda %>% 
+  ggplot(aes( x = hhinc)) +
+  geom_histogram()
+```
+
+
+This is a histogram of the recoded income variables. As you can see, a lot of households have an aggregate income of more than $100,000, which corresponds to the value 41. 
+
+```{r}
+hc_eda %>% ggplot(aes(x = as.factor(now_hcov_recode), y = as.factor(hcov_recode))) +
+  geom_bin2d() +
+  labs(x = "Current Healthcare Coverage", y = "Healthcare Coverage Past Year")
+```
+
+I recoded a question asking about healthcare coverage, not currently, but in the past year. The response options were identical, and there is little change between responses regarding the past year and current healthcare coverage. 
+
+### Model Building 
+
+#### Data Setup
+```{r, message=FALSE}
+hc <- read_csv("data/asec_clean.csv")
+
+hc <- hc %>% dplyr::select(-now_hcov, -hcov_recode, -hpub, -now_hpub, -hpriv, -now_hpriv,
+                    -hmcaid, -now_hmcaid, -hcov, -hwcval, -hwsval)
+
+# these predictors are standins of "do you have healthcare". It's not interesting to predict healthcare status with the question "do you have private healthcare" or "do you have medicaid". 
+
+
+hc_test <- hc %>% sample_frac(0.15)
+
+hc_train <- hc %>% setdiff(hc_test)
+```
+
+#### Ridge and Lasso Regression
+
+My implementation of Ridge and Lasso Regression are both available in the file titled model_building.R. The results were unimpressive and not useful for prediction. The error rate of the null classifier was 13.4%. The error rate of lasso_min, lasso_1se, and ridge_1se were 13.3%. So I beat the null classifier by 0.1%. Upon closer inspection, the models were all too conservative in their prediction of positives. The reason that that error rate was nearly the same as the null classifier is because there were very few 1s that were predicted. 
+
+#### Forward Selection
+```{r}
+hc_fwd <- regsubsets(now_hcov_recode ~ ., data = hc_train, method = "forward")
+
+predict_regsubset <- function(object, fmla , new_data, model_id)
+{
+  # Not a dataframe? -- handle resample objects/k-folds
+  if(!is.data.frame(new_data)){
+    new_data <- as_tibble(new_data)
+  }
+  
+  # Get formula
+  obj_formula <- as.formula(fmla)
+  
+  # Extract coefficients for desired model
+  coef_vector <- coef(object, model_id)
+  
+  # Get appropriate feature matrix for new_data
+  x_vars <- names(coef_vector)
+  mod_mat_new <- model.matrix(obj_formula, new_data)[ , x_vars]
+  
+  # Get predicted values
+  pred <- as.numeric(mod_mat_new %*% coef_vector)
+  pred <- ifelse(pred > 0.5, 1, 0)
+  return(pred)
+}
+
+test_error_regsubset <- function(object, fmla , test_data){
+  
+  # Number of models
+  num_models <- object %>% summary() %>% pluck("which") %>% dim() %>% .[1]
+  
+  # Set up storage
+  test_mse <- rep(NA, num_models)
+  
+  # observed targets
+  obs_target <- test_data %>% 
+    as_tibble() %>% 
+    pull(!!as.formula(fmla)[[2]])
+  
+  # Calculate test MSE for each model class
+  for(i in 1:num_models){
+    pred <- predict_regsubset(object, fmla, test_data, model_id = i)
+    test_mse[i] <- mean((obs_target - pred)^2) #this is the same as test error for binom
+  }
+  
+  # Return the test errors for each model class
+  tibble(model_index = 1:num_models,
+         test_error    = test_mse)
+}
+
+regsubset_error <- tibble(train = list(hc_train), 
+                        test = list(hc_test)) %>% 
+  mutate(fit = list(hc_fwd),
+         test_error = map2(fit, test, ~test_error_regsubset(object = .x, fmla = "now_hcov_recode ~ .",
+                                                            test_data = .y)))
+
+regsubset_error %>% 
+  select(fit, test_error) %>% unnest(test_error) %>% arrange(test_error)
+```
+
+```{r}
+regsubset_error %>% 
+  pluck("fit") %>% 
+  map( ~ coef(.x, id = 8)) %>% 
+  map2(c("fwd"), ~ enframe(.x, value = .y)) %>% 
+  reduce(full_join) %>% 
+  knitr::kable(digits = 3)
+```
+
+Though the error rate is still 13.3%, I included this model to demonstrate that the helper function was adapted for logistic regression. In addition, the model using forward selection ends up being a more brief model than lasso regression. It appears that self employment was associated with family healthcare coverage, as was wage and salary based employment. The more people per household was associated with an increased likelihood of having some or no people covered by insurance, as was receipt of social security payments. However, it should be noted that no conclusions should be drawn from these coefficients as the predictions made were largely inaccurate. I followed forward selection with an attempt to build a classification tree. 
+
+#### Classification Tree
+```{r}
+hc_tree <- rpart(as.factor(now_hcov_recode) ~ ., data = hc_train, method = "class")
+
+printcp(hc_tree)
+```
+
+The tree was empty, which indicates that no predictors were particularly adept at predicting whether or not a household has healthcare for all versus healthcare for some or none. 
+
+### Inference and Analysis
+
+#### An inferentially valuable model
+
+In this model, I remove all of the predictors that would allow me to "cheat" other than the responses to the question about if a household has had healthcare in the past 12 months. 
+
+```{r, message=FALSE}
+hc_inf <- read_csv("data/asec_clean.csv")
+
+hc_inf <- hc_inf %>% dplyr::select(-now_hcov, -hpub, -now_hpub, -hpriv, -now_hpriv,
+                               -hmcaid, -now_hmcaid, -hcov, -hwcval, -hwsval)
+
+hc_inf_test <- hc_inf %>% sample_frac(0.15)
+
+hc_inf_train <- hc_inf %>% setdiff(hc_inf_test)
+```
+
+```{r}
+hc_inf_fwd <- regsubsets(now_hcov_recode ~ ., data = hc_inf_train, method = "forward")
+
+regsubset_inf <- tibble(train = list(hc_inf_train), 
+                        test = list(hc_inf_test)) %>% 
+  mutate(fit = list(hc_inf_fwd),
+         test_error = map2(fit, test, ~test_error_regsubset(object = .x, fmla = "now_hcov_recode ~ .",
+                                                            test_data = .y)))
+
+regsubset_inf %>% 
+  select(fit, test_error) %>% unnest(test_error) %>% arrange(test_error)
+```
+
+```{r}
+regsubset_inf %>% 
+  pluck("fit") %>% 
+  map( ~ coef(.x, id = 1)) %>% 
+  map2(c("fwd"), ~ enframe(.x, value = .y)) %>% 
+  reduce(full_join) %>% 
+  knitr::kable(digits = 3)
+```
+
+The error rate drops to 3.3% when the question about healthcare in the past 12 months is included. This is valuable to know because it indicates that healthcare coverage is relatively static. Households that had healthcare for everyone anytime the past year are likely to currently have healthcare and households that did not have healthcare for all members at any point in the past year are unlikely to have healthcare for all members currently. This is important in building an understanding of the structure of the healthcare market as it is both encouraging that discontinuance of healthcare is low. However, it is also concerning that those lacking coverage are unlikely to gain coverage over the course of a year. Further investigation into the 3.2% of households whose healthcare status did change is warranted. More research should be done to see if the majority of these household discontinued healthcare for some or all individuals or if these households expanded the number of individuals covered in their households. 
+
+### Debriefing and Conclusions
+
+Unfortunately, I was unable to produce an accurate predictive model for households with or without healthcare. However, potential avenues that warrant more exploration are nonlinear transformation and investigation of interaction terms. Another important feature to consider is that this dataset was largely composed of binary variables. Perhaps my predictions could have been more accurate or robust if the features of my dataset were more diverse. Furthermore, I believe that the classfication tree is a promising avenue to follow. However, I have not learned enough about the implementation of a classification tree or about how to optimize my use of such a function. However, I am pleased that an inferentially valuable question I had about healthcare status was answered, which reflect my understanding of the stagnancy of healthcare coverage in the United States. 
